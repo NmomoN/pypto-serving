@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig
 
 
-_VALID_BACKENDS = {"npu"}
+_VALID_BACKENDS = {"npu", "torch"}
 _LEGACY_SERVING_PROFILE_ENV = ("SA_PROFILE_OUTPUT", "SA_PROFILE_LEVEL")
 
 
@@ -65,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Backend and device
     parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
+    parser.add_argument(
+        "--torch-graph-mode", choices=("NONE", "FULL", "PIECEWISE"), default="NONE",
+        help="vLLM Ascend graph mode for --backend torch (default: NONE).",
+    )
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
     parser.add_argument(
@@ -303,6 +307,21 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_family = detect_model_family(model_config_data)
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
+    if args.backend == "torch":
+        raw_architecture = model_config_data.get("architectures", [])
+        if raw_architecture != ["Qwen3ForCausalLM"]:
+            raise ValueError("--backend torch currently requires dense Qwen3ForCausalLM")
+        if (len(devices) != 1 or args.tensor_parallel_size != 1
+                or args.data_parallel_size != 1 or args.expert_parallel_size != 1):
+            raise ValueError("--backend torch currently requires one device and TP=DP=EP=1")
+        if args.dtype != "bfloat16" or args.kv_cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError("--backend torch currently requires BF16 weights and KV cache")
+        if args.kv_offload_bytes or args.pd_role:
+            raise ValueError("--backend torch currently requires resident colocated KV cache")
+        executor_kwargs.update(
+            graph_mode=args.torch_graph_mode, enable_prefix_caching=args.enable_prefix_caching,
+            enable_chunked_prefill=args.enable_chunked_prefill,
+        )
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
@@ -361,7 +380,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         device_id=first_group[0],
         device_ids=worker_device_ids,
         parallel_config=parallel_config,
-        executor_cls=_executor_cls_for_model_family(model_family, variant=model_variant),
+        executor_cls=(
+            "TorchQwenExecutor" if args.backend == "torch"
+            else _executor_cls_for_model_family(model_family, variant=model_variant)
+        ),
         executor_kwargs=executor_kwargs,
         runtime_config=_build_runtime_config(
             args,
@@ -1135,8 +1157,8 @@ def _format_parallelism(config: EngineConfig) -> str:
 
 
 def _validate_backend(backend: str) -> None:
-    if backend != "npu":
-        raise ValueError(f"Only NPU backend is supported, got: {backend}")
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(f"Unsupported backend: {backend}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

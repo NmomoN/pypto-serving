@@ -249,6 +249,10 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "TorchQwenExecutor":
+            from pypto_serving.model.qwen.torch_executor import TorchQwenExecutor
+
+            return TorchQwenExecutor
         if self.config.executor_cls == "PyptoDeepSeekV41Executor":
             from pypto_serving.model.deepseek_v41.npu_executor import DeepSeekV41PyptoExecutor
 
@@ -886,6 +890,9 @@ class WorkerProcess:
                     raise
                 self._constraint_states[new_request.request_id] = state
             self._req_cache[new_request.request_id] = new_request
+        register_requests = getattr(self.executor, "register_requests", None)
+        if cmd.new_requests and callable(register_requests):
+            register_requests(cmd.new_requests)
 
     def _release_finished_request_state(
         self,

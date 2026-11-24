@@ -27,6 +27,10 @@ class SamplingCapabilities:
 
 def sampling_capabilities(executor_cls: str, num_speculative_tokens: int) -> SamplingCapabilities:
     """Declare the stop-mask path for each serving executor configuration."""
+    if executor_cls == "TorchQwenExecutor":
+        return SamplingCapabilities(
+            prefill_stop_mask="device", decode_stop_mask="device", top_p_on_device=True,
+        )
     if executor_cls == "PyptoDeepSeekV4DSparkExecutor":
         return SamplingCapabilities(prefill_stop_mask="device", decode_stop_mask="device")
     if executor_cls == "PyptoDeepSeekV4Executor":

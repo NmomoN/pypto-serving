@@ -34,7 +34,8 @@ pypto-serving \
 | --- | --- | --- |
 | `--model PATH` | Required | Model directory. |
 | `--served-model-name NAME` | Directory name | Model name returned by the API. |
-| `--backend npu` | `npu` | Inference backend. `npu` is the only supported backend. |
+| `--backend {npu,torch}` | `npu` | PyPTO kernels or the optional vLLM Ascend Torch adapter. |
+| `--torch-graph-mode {NONE,FULL,PIECEWISE}` | `NONE` | Graph mode for the Torch adapter. |
 | `--platform NAME` | `a2a3` | Target NPU platform. |
 | `--device ID` | `0` | Single default device ID. |
 | `--devices LIST` | unset | Comma-separated device IDs for multi-device placement. |
