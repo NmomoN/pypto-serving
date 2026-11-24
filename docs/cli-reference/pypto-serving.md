@@ -36,6 +36,8 @@ pypto-serving \
 | `--served-model-name NAME` | Directory name | Model name returned by the API. |
 | `--backend {npu,torch}` | `npu` | PyPTO kernels or the optional vLLM Ascend Torch adapter. |
 | `--torch-graph-mode {NONE,FULL,PIECEWISE}` | `NONE` | Graph mode for the Torch adapter. |
+| `--async-scheduling / --no-async-scheduling` | automatic | Control engine scheduling and the Torch model runner together. V4.1 retains its synchronous contract. |
+| `--total-kv-pages` | automatic | Optional positive primary KV page capacity. Torch reserves one additional native null page. |
 | `--platform NAME` | `a2a3` | Target NPU platform. |
 | `--device ID` | `0` | Single default device ID. |
 | `--devices LIST` | unset | Comma-separated device IDs for multi-device placement. |

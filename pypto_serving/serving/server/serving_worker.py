@@ -100,6 +100,7 @@ class _PendingPrefillOutput:
     scheduled: tuple[PrefillRequest, ...]
     pending: object
     buffer_slot: int
+    batch: PrefillBatch | None = None
 
 
 @dataclass(frozen=True)
@@ -208,11 +209,14 @@ class WorkerProcess:
             self.sampler = Sampler()
 
             executor_cls = self._resolve_executor_cls()
+            executor_kwargs = dict(self.config.executor_kwargs)
+            if self.config.executor_cls == "TorchQwenExecutor":
+                executor_kwargs.setdefault("async_scheduling", self.config.resolve_async_scheduling())
             self.executor = executor_cls(
                 platform=self.config.platform,
                 device_ids=device_ids,
                 pypto_build_dir=str(pypto_build_dir) if pypto_build_dir is not None else None,
-                **self.config.executor_kwargs,
+                **executor_kwargs,
             )
 
             loaded = ModelLoader().load(
@@ -298,6 +302,7 @@ class WorkerProcess:
         executor = getattr(self, "executor", None)
         async_enabled = bool(config is not None and config.resolve_async_scheduling())
         if async_enabled and executor is not None and executor.supports_async_decode_prepare:
+            logger.info("Worker using prepare/dispatch/reclaim pipeline")
             self._pipelined_busy_loop()
         else:
             self._serial_busy_loop()
@@ -509,6 +514,7 @@ class WorkerProcess:
                     output_work_queue.put(_PendingPrefillOutput(
                         cmd=cmd, scheduled=tuple(cmd.prefill_requests),
                         pending=pending, buffer_slot=prepared.buffer_slot,
+                        batch=prepared.prefill_batch,
                     ))
                 except Exception as exc:
                     logger.error("Worker prefill dispatch failed: %s", exc, exc_info=True)
@@ -688,8 +694,17 @@ class WorkerProcess:
         try:
             with profile_span("WorkerProcess.reclaim_prefill", cat="worker",
                               args={"step_id": work.cmd.step_id}):
-                self.executor.reclaim_prepared_prefill(work.pending)
-            return StepResult(new_tokens={}, step_id=work.cmd.step_id)
+                result = self.executor.reclaim_prepared_prefill(work.pending)
+                new_tokens = {}
+                if result is not None and work.batch is not None:
+                    self._consume_prefill_result(
+                        list(work.scheduled), self.model_record.runtime_model,
+                        work.batch, result, new_tokens,
+                    )
+                    for request_id, tokens in new_tokens.items():
+                        if tokens:
+                            self._record_last_tokens(request_id, tokens)
+            return StepResult(new_tokens=new_tokens, step_id=work.cmd.step_id)
         except Exception as exc:
             logger.error("Worker prefill reclaim failed: %s", exc, exc_info=True)
             return StepResult(new_tokens={}, error=str(exc), step_id=work.cmd.step_id)
@@ -1112,8 +1127,6 @@ class WorkerProcess:
             args={"batch_size": len(scheduled), "request_ids": [pr.request_id for pr in scheduled]},
         ):
             batch = self._make_prefill_batch(scheduled, runtime_model)
-            allow_device_greedy_sampling = batch.allow_device_greedy_sampling
-            allow_device_topk_sampling = batch.allow_device_topk_sampling
             if prefill_slot is not None and getattr(self.executor, "supports_async_prefill_reclaim", False):
                 prefill_result = self.executor.run_prefill_in_slot(
                     runtime_model, batch, buffer_slot=prefill_slot,
@@ -1121,68 +1134,73 @@ class WorkerProcess:
             else:
                 prefill_result = self.executor.run_prefill(runtime_model, batch)
 
-            # Sample only for requests whose prefill chunk completes the prompt.
-            completed_request_ids: list[str] = []
-            completed_token_ids: list[int] = []
-            completed_sampling_params: list[SamplingParams] = []
-            for i, pr in enumerate(scheduled):
-                cached = self._req_cache[pr.request_id]
-                # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
-                will_be_computed = pr.num_computed_tokens + len(pr.chunk_tokens)
-                if will_be_computed >= len(cached.prompt_token_ids):
-                    logits = (
-                        prefill_result.logits[i]
-                        if prefill_result.logits.dim() > 1
-                        else prefill_result.logits
-                    )
-                    params = self._sampling_params(pr.request_id)
-                    token_id = self._sample_result_row(
-                        prefill_result,
-                        logits,
-                        params,
-                        pr.request_id,
-                        i,
-                        allow_device_greedy_sampling,
-                        allow_device_topk_sampling=allow_device_topk_sampling,
-                    )
-                    new_tokens[pr.request_id] = [token_id]
-                    constraint_state = getattr(self, "_constraint_states", {}).get(pr.request_id)
-                    if constraint_state is not None:
-                        constraint_state.accept((token_id,))
-                    self._accept_output_tokens(pr.request_id, 1)
-                    completed_request_ids.append(pr.request_id)
-                    completed_token_ids.append(token_id)
-                    completed_sampling_params.append(params)
+            self._consume_prefill_result(scheduled, runtime_model, batch, prefill_result, new_tokens)
 
-            # MTP prefill needs the first sampled output token to build its
-            # shifted input. Keep that work in the terminal-prefill command so
-            # the first decode only consumes already-initialized device state.
-            if completed_request_ids:
-                self.executor.finalize_prefill(
-                    runtime_model,
-                    completed_request_ids,
-                    completed_token_ids,
-                    completed_sampling_params,
+    def _consume_prefill_result(self, scheduled, runtime_model, batch, prefill_result, new_tokens):
+        allow_device_greedy_sampling = batch.allow_device_greedy_sampling
+        allow_device_topk_sampling = batch.allow_device_topk_sampling
+        # Sample only for requests whose prefill chunk completes the prompt.
+        completed_request_ids: list[str] = []
+        completed_token_ids: list[int] = []
+        completed_sampling_params: list[SamplingParams] = []
+        for i, pr in enumerate(scheduled):
+            cached = self._req_cache[pr.request_id]
+            # num_prompt_tokens is len(prompt_token_ids), which we have in cache.
+            will_be_computed = pr.num_computed_tokens + len(pr.chunk_tokens)
+            prompt_len = batch.prompt_lens[i] if i < len(batch.prompt_lens) else len(cached.prompt_token_ids)
+            if will_be_computed >= prompt_len:
+                logits = (
+                    prefill_result.logits[i]
+                    if prefill_result.logits.dim() > 1
+                    else prefill_result.logits
                 )
-                if (isinstance(getattr(runtime_model, "extra", None), dict)
-                        and runtime_model.extra.get("family") == "deepseek_v41"
-                        and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
-                    lower = getattr(self.executor, "lower_dspark_prefill_batch", None)
-                    if not callable(lower):
-                        self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
-                    for request_id, token_id in zip(
-                        completed_request_ids, completed_token_ids, strict=True
-                    ):
-                        dispatch = lower(
-                            runtime_model,
-                            batch,
-                            request_ids=(request_id,),
-                            sampled_token_ids=(token_id,),
-                        )
-                        self.executor.run_dspark_prefill_batch(
-                            replace(batch, dspark_stages=dispatch)
-                        )
+                params = batch.sampling_params.get(pr.request_id) or self._sampling_params(pr.request_id)
+                token_id = self._sample_result_row(
+                    prefill_result,
+                    logits,
+                    params,
+                    pr.request_id,
+                    i,
+                    allow_device_greedy_sampling,
+                    allow_device_topk_sampling=allow_device_topk_sampling,
+                )
+                new_tokens[pr.request_id] = [token_id]
+                constraint_state = getattr(self, "_constraint_states", {}).get(pr.request_id)
+                if constraint_state is not None:
+                    constraint_state.accept((token_id,))
+                self._accept_output_tokens(pr.request_id, 1)
+                completed_request_ids.append(pr.request_id)
+                completed_token_ids.append(token_id)
+                completed_sampling_params.append(params)
 
+        # MTP prefill needs the first sampled output token to build its
+        # shifted input. Keep that work in the terminal-prefill command so
+        # the first decode only consumes already-initialized device state.
+        if completed_request_ids:
+            self.executor.finalize_prefill(
+                runtime_model,
+                completed_request_ids,
+                completed_token_ids,
+                completed_sampling_params,
+            )
+            if (isinstance(getattr(runtime_model, "extra", None), dict)
+                    and runtime_model.extra.get("family") == "deepseek_v41"
+                    and getattr(runtime_model.runtime, "num_speculative_tokens", 0) == 5):
+                lower = getattr(self.executor, "lower_dspark_prefill_batch", None)
+                if not callable(lower):
+                    self._require_v41_dspark_stages(runtime_model, batch, phase="prefill")
+                for request_id, token_id in zip(
+                    completed_request_ids, completed_token_ids, strict=True
+                ):
+                    dispatch = lower(
+                        runtime_model,
+                        batch,
+                        request_ids=(request_id,),
+                        sampled_token_ids=(token_id,),
+                    )
+                    self.executor.run_dspark_prefill_batch(
+                        replace(batch, dspark_stages=dispatch)
+                    )
     def _resolve_decode_token(self, dr: DecodeRequest) -> int:
         """Return the decode input token, substituting from cache on placeholder.
 
@@ -1220,9 +1238,19 @@ class WorkerProcess:
                     )
                     if len(chunks) != 1:
                         return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot)
+                terminal = [
+                    item for item in scheduled
+                    if item.num_computed_tokens + len(item.chunk_tokens)
+                    >= len(self._req_cache[item.request_id].prompt_token_ids)
+                ]
+                terminal_needs_host = terminal and (
+                    not getattr(self.executor, "supports_async_prefill_sampling", False)
+                    or any(getattr(self._req_cache[item.request_id], "constraint_spec", None) is not None
+                           or getattr(self._req_cache[item.request_id], "min_tokens", 0) > 0
+                           for item in terminal)
+                )
                 if (cmd.decode_requests or any(item.request_id in cmd.finished_request_ids for item in scheduled)
-                        or any(item.num_computed_tokens + len(item.chunk_tokens) >=
-                               len(self._req_cache[item.request_id].prompt_token_ids) for item in scheduled)):
+                        or terminal_needs_host):
                     return _PreparedDecodeWork(prepared=None, buffer_slot=buffer_slot)
                 model = self.model_record.runtime_model
                 batch = self._make_prefill_batch(scheduled, model)
@@ -1347,7 +1375,10 @@ class WorkerProcess:
             batch = self._batch_builder(
                 scheduled,
                 runtime_model,
-                resolve_tokens=True,
+                resolve_tokens=not (
+                    getattr(self.executor, "supports_device_token_dependency", False)
+                    and allow_device_greedy_sampling
+                ),
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
                 allow_device_topk_sampling=allow_device_topk_sampling,
             )

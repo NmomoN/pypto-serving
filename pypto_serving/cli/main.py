@@ -69,6 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--torch-graph-mode", choices=("NONE", "FULL", "PIECEWISE"), default="NONE",
         help="vLLM Ascend graph mode for --backend torch (default: NONE).",
     )
+    parser.add_argument(
+        "--async-scheduling", action=argparse.BooleanOptionalAction, default=None,
+        help="Enable asynchronous serving scheduling; Torch also uses the async model runner.",
+    )
     parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
     parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
     parser.add_argument(
@@ -118,6 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="DDR cache storage/transfer backend (default: simpler).")
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+    parser.add_argument("--total-kv-pages", type=int, default=None,
+                        help="Optional usable KV page count per worker; must be positive.")
     parser.add_argument(
         "--npu-memory-utilization",
         type=float,
@@ -290,6 +296,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
+    if getattr(args, "total_kv_pages", None) is not None and args.total_kv_pages <= 0:
+        raise ValueError("--total-kv-pages must be positive")
     if args.max_num_seqs is None:
         if args.pd_role:
             from pypto_serving.pd.config import default_max_num_seqs
@@ -321,6 +329,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         executor_kwargs.update(
             graph_mode=args.torch_graph_mode, enable_prefix_caching=args.enable_prefix_caching,
             enable_chunked_prefill=args.enable_chunked_prefill,
+            async_scheduling=getattr(args, "async_scheduling", None) is not False,
         )
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
@@ -396,6 +405,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         enable_prefix_cache=enable_prefix_cache,
         enable_chunk_prefill=args.enable_chunked_prefill,
+        async_scheduling=getattr(args, "async_scheduling", None),
     )
 
 
@@ -406,6 +416,9 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     The scheduler uses one cache partition per configured DP/EP rank instead of creating DP replicas.
     """
     from pypto_serving.config.types import KVCacheGroupSpec
+    if getattr(args, "async_scheduling", None) is True:
+        raise ValueError("DeepSeek V4.1 currently requires synchronous scheduling")
+
     from pypto_serving.model.deepseek_v41.npu_runner import (
         MAX_PREFILL_TOKENS_PER_DP, MissingCompositeInterface, SegmentTopology, load_composite_bindings,
     )
@@ -583,6 +596,7 @@ def _build_runtime_config(
         device="cpu",
         kv_dtype=kv_dtype,
         weight_dtype=args.dtype,
+        total_kv_pages=getattr(args, "total_kv_pages", None),
         npu_memory_utilization=args.npu_memory_utilization,
         kv_offload_bytes=args.kv_offload_bytes,
         kv_offload_backend=args.kv_offload_backend,

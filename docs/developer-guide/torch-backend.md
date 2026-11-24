@@ -12,8 +12,9 @@ required at 0.23.0 for this adapter. Use the corresponding TorchNPU/CANN stack.
 
 `--torch-graph-mode NONE` selects eager execution. FULL and PIECEWISE use the
 normal vLLM Ascend compilation and graph-capture path. For a fair comparison,
-configure native vLLM with the same graph mode and synchronous model runner
-(`--no-async-scheduling`), weights, dtype, block size, prefix-cache setting,
+configure native vLLM with the same graph mode and scheduling flag
+(`--async-scheduling` on both sides, or `--no-async-scheduling` on both), weights,
+dtype, block size, prefix-cache setting,
 token budget, request limit, sampling and request data. Serving may choose
 different batch shapes or dispatch prefill and decode separately. Those choices
 remain part of the scheduler comparison.
@@ -28,3 +29,15 @@ Validate deterministic outputs, chunked prefill, batched decode, prefix hits,
 restart/release and HTTP streaming before reporting latency or throughput.
 Performance logs should identify both the shared execution path and every
 remaining configuration or batch-shape difference.
+
+The default Torch path enables the asynchronous engine and model runner.
+The serving worker prepares immutable metadata on its command lane, submits
+prefill/decode on its device lane, and materializes the native async output on
+its output lane. Device-side sampled tokens feed the next decode. Terminal
+prefill sampling uses the output lane as well. Host constraints and mixed
+commands retain ordered fallbacks where required by the common worker.
+
+Requests rejoining the batch recover committed CPU token history when no prior
+GPU row exists. A failed reclaim wakes recovery waiters, and release remains
+behind prior output completion. Captured prompt lengths govern delayed prefill
+results even when a later registration reuses the same request ID.
