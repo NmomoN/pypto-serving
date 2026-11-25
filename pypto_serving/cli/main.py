@@ -315,6 +315,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_family = detect_model_family(model_config_data)
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
+    if args.backend == "torch" and model_family == "deepseek_v41":
+        from pypto_serving.model.deepseek_v41.torch_config import build_torch_engine_config
+
+        return build_torch_engine_config(args, model_dir, model_config_data, devices)
     if args.backend == "torch":
         raw_architecture = model_config_data.get("architectures", [])
         if raw_architecture != ["Qwen3ForCausalLM"]:

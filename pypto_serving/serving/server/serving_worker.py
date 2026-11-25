@@ -183,7 +183,8 @@ class WorkerProcess:
 
         device_ids = self.config.worker_device_ids()
         device_label = ",".join(str(device_id) for device_id in device_ids)
-        pypto_build_dir = self._configure_pypto_build_dir(device_ids)
+        pypto_build_dir = (None if self.config.executor_cls == "TorchDeepSeekV41Executor"
+                           else self._configure_pypto_build_dir(device_ids))
         configure_profiler(
             self.config.profile_config,
             process_name=f"serving-worker-{device_label}",
@@ -210,7 +211,7 @@ class WorkerProcess:
 
             executor_cls = self._resolve_executor_cls()
             executor_kwargs = dict(self.config.executor_kwargs)
-            if self.config.executor_cls == "TorchQwenExecutor":
+            if self.config.executor_cls in ("TorchQwenExecutor", "TorchDeepSeekV41Executor"):
                 executor_kwargs.setdefault("async_scheduling", self.config.resolve_async_scheduling())
             self.executor = executor_cls(
                 platform=self.config.platform,
@@ -219,10 +220,18 @@ class WorkerProcess:
                 **executor_kwargs,
             )
 
-            loaded = ModelLoader().load(
+            if self.config.executor_cls == "TorchDeepSeekV41Executor":
+                from pypto_serving.model.deepseek_v41.torch_loader import DeepSeekV41TorchDirectoryLoader
+
+                loader = ModelLoader(format_loaders=[DeepSeekV41TorchDirectoryLoader()])
+            else:
+                loader = ModelLoader()
+            loaded = loader.load(
                 model_id=self.config.model_id,
                 model_dir=self.config.model_dir,
                 runtime_config=self.config.runtime_config,
+                **({"model_format": "deepseek_v41_torch"}
+                   if self.config.executor_cls == "TorchDeepSeekV41Executor" else {}),
             )
 
             self.model_record = ModelRecord(
@@ -253,6 +262,10 @@ class WorkerProcess:
             return num_pages
 
     def _resolve_executor_cls(self):
+        if self.config.executor_cls == "TorchDeepSeekV41Executor":
+            from pypto_serving.model.deepseek_v41.torch_executor import TorchDeepSeekV41Executor
+
+            return TorchDeepSeekV41Executor
         if self.config.executor_cls == "TorchQwenExecutor":
             from pypto_serving.model.qwen.torch_executor import TorchQwenExecutor
 

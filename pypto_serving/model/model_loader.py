@@ -456,6 +456,9 @@ class ModelLoader:
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
+        if format_loaders:
+            self._format_loaders = format_loaders
+            return
         from .deepseek_v41.npu_executor import DeepSeekV41DirectoryLoader
 
         self._format_loaders = format_loaders or [
@@ -476,7 +479,8 @@ class ModelLoader:
         **loader_options: object,
     ) -> LoadedModel:
         """Load a model directory using an explicit or inferred format."""
-        if is_deepseek_v41_config(read_model_config(model_dir)):
+        if (is_deepseek_v41_config(read_model_config(model_dir))
+                and model_format != "deepseek_v41_torch"):
             from .deepseek_v41.npu_executor import DeepSeekV41DirectoryLoader
 
             if model_format is not None and not DeepSeekV41DirectoryLoader().supports_format(model_format):

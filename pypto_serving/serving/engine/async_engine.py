@@ -590,6 +590,8 @@ class ReplicaEngineCore:
         constraint_spec: ConstraintSpec | None = None,
     ) -> AsyncGenerator[TokenOutput, None]:
         """Add a request and yield token outputs as they are generated."""
+        if self.config.executor_cls == "TorchDeepSeekV41Executor" and constraint_spec is not None:
+            raise ValueError("Torch V4.1 structured constraints require a native grammar bridge")
         with profile_span(
             "ReplicaEngineCore.add_request",
             cat="serving",
