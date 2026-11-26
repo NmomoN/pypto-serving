@@ -13,6 +13,8 @@ import logging
 import math
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from importlib.metadata import version
 
@@ -34,6 +36,13 @@ class PendingOutput:
     request_ids: tuple[str, ...]
     execution: object
     sampling: object
+    masking: object = None
+
+
+@dataclass(frozen=True)
+class PendingDPStep:
+    request_ids: tuple[str, ...]
+    outputs: tuple[PendingOutput, ...]
 
 
 def logical_page_capacity(cache, runtime):
@@ -71,13 +80,16 @@ class TorchDeepSeekV41Executor(ModelExecutor):
 
     def __init__(self, kv_cache_manager=None, *, platform="a2a3", device_ids=(0,),
                  pypto_build_dir=None, graph_mode="NONE", async_scheduling=True,
-                 enable_chunked_prefill=True):
+                 enable_chunked_prefill=True, data_parallel_size=1):
         super().__init__(kv_cache_manager)
         if platform != "a2a3" or not device_ids or len(set(device_ids)) != len(device_ids):
             raise ValueError("Torch V4.1 requires distinct A2/A3 devices")
         if graph_mode not in ("NONE", "FULL", "PIECEWISE"):
             raise ValueError(f"Unsupported Torch graph mode {graph_mode!r}")
+        if data_parallel_size < 1 or len(device_ids) % data_parallel_size:
+            raise ValueError("Torch V4.1 requires an equal TP group for each DP rank")
         self.device_ids = tuple(device_ids)
+        self.data_parallel_size = data_parallel_size
         self.graph_mode = graph_mode
         self.async_scheduling = async_scheduling
         self.enable_chunked_prefill = enable_chunked_prefill
@@ -92,6 +104,8 @@ class TorchDeepSeekV41Executor(ModelExecutor):
         # MultiprocExecutor futures share one FIFO response queue.
         self._rpc_read_lock = threading.Lock()
         self._async_error = None
+        self._dp_groups = ()
+        self._request_dp = {}
 
     supports_device_embedding = property(lambda self: True)
     supports_device_sampling = property(lambda self: True)
@@ -112,11 +126,6 @@ class TorchDeepSeekV41Executor(ModelExecutor):
                 raise ValueError("Torch V4.1 requires the vLLM/vLLM Ascend 0.30 stack")
         from vllm.engine.arg_utils import EngineArgs
         from vllm.plugins import load_general_plugins
-        from vllm.v1.executor.abstract import Executor
-        from vllm.v1.core.kv_cache_manager import KVCacheManager
-        from vllm.v1.core.kv_cache_utils import (
-            generate_scheduler_kv_cache_config, get_kv_cache_configs, resolve_kv_cache_block_sizes,
-        )
 
         if (record.config.architecture != "DeepseekV41ForCausalLM"
                 or record.runtime_model.extra.get("checkpoint_format") != "ascend-w8a8-dynamic"):
@@ -128,50 +137,124 @@ class TorchDeepSeekV41Executor(ModelExecutor):
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
         load_general_plugins()
+        dp_args = {}
+        if self.data_parallel_size > 1:
+            from vllm.config import EngramConfig
+
+            dp_args = dict(
+                data_parallel_size=self.data_parallel_size,
+                data_parallel_size_local=self.data_parallel_size,
+                data_parallel_address=os.environ["VLLM_HOST_IP"],
+                enable_expert_parallel=True,
+                engram_config=EngramConfig(cpu_offload=True, dp_shared_memory=True),
+                tokenizer_mode="deepseek_v41", safetensors_load_strategy="lazy",
+                additional_config=dict(enable_cpu_binding=True, enable_fused_mc2=0,
+                                       enable_dsa_cp=True, enable_flashcomm1=True,
+                                       enable_shared_expert_dp=True),
+            )
         args = EngineArgs(
             model=record.runtime_model.extra["model_dir"], dtype="bfloat16", quantization="ascend",
-            tensor_parallel_size=len(self.device_ids), distributed_executor_backend="mp",
+            tensor_parallel_size=len(self.device_ids) // self.data_parallel_size,
+            distributed_executor_backend="mp",
             max_model_len=self.runtime.max_seq_len, max_num_seqs=self.runtime.max_batch_size,
             max_num_batched_tokens=self.runtime.max_num_batched_tokens,
             block_size=self.runtime.page_size, gpu_memory_utilization=self.runtime.npu_memory_utilization,
             enable_prefix_caching=False, enable_chunked_prefill=self.enable_chunked_prefill,
             enforce_eager=self.graph_mode == "NONE", async_scheduling=self.async_scheduling,
             compilation_config={"cudagraph_mode": self.graph_mode},
-            generation_config="vllm", limit_mm_per_prompt={"image": 0}, seed=0,
+            generation_config="vllm", limit_mm_per_prompt={"image": 0}, seed=0, **dp_args,
         )
         self.config = args.create_engine_config()
         try:
-            self.worker = Executor.get_class(self.config)(self.config)
-            specs = self.worker.get_kv_cache_specs()
-            available = self.worker.determine_available_memory()
-            caches = get_kv_cache_configs(self.config, specs, available)
-            scheduler_cache = generate_scheduler_kv_cache_config(caches)
-            logical_pages = logical_page_capacity(scheduler_cache, self.runtime)
-            self.config.cache_config.num_gpu_blocks = scheduler_cache.num_blocks
-            self.worker.initialize_from_config(caches)
-            block_size, hash_size = resolve_kv_cache_block_sizes(scheduler_cache, self.config)
-            self.native_kv = KVCacheManager(
-                scheduler_cache, max_model_len=self.runtime.max_seq_len,
-                scheduler_block_size=block_size, hash_block_size=hash_size,
-                max_in_flight_tokens=self.config.max_in_flight_tokens, enable_caching=False,
-            )
-            self._group_count = len(scheduler_cache.kv_cache_groups)
-            self._zero_blocks = scheduler_cache.needs_kv_cache_zeroing
-            logger.info("Torch V4.1 vLLM=0.30 TP=%d devices=%s graph=%s async=%s "
-                        "native_physical_blocks=%d groups=%d serving_logical_pages=%d prefix_cache=False",
-                        len(self.device_ids), self.device_ids, self.graph_mode, self.async_scheduling,
-                        scheduler_cache.num_blocks, self._group_count, logical_pages)
-            return logical_pages
+            if self.data_parallel_size == 1:
+                return self._initialize_native()
+            tp = len(self.device_ids) // self.data_parallel_size
+            groups = []
+            for rank in range(self.data_parallel_size):
+                group = TorchDeepSeekV41Executor(
+                    device_ids=self.device_ids[rank * tp:(rank + 1) * tp], graph_mode=self.graph_mode,
+                    async_scheduling=self.async_scheduling, enable_chunked_prefill=self.enable_chunked_prefill,
+                )
+                group.runtime = self.runtime
+                group.config = deepcopy(self.config)
+                parallel = group.config.parallel_config
+                parallel.data_parallel_rank = rank
+                parallel.data_parallel_rank_local = rank
+                parallel.data_parallel_index = rank
+                groups.append(group)
+            self._dp_groups = tuple(groups)
+            # Initialization and memory profiling run collectives across all DP
+            # ranks. Start all executors before waiting for any single group.
+            with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+                pending = [pool.submit(group._initialize_native, warm_up=True) for group in groups]
+                capacities = [future.result() for future in pending]
+            logger.info("Torch V4.1 DP=%d TP=%d EP=%d devices=%s",
+                        self.data_parallel_size, tp, len(self.device_ids), self.device_ids)
+            # Serving's logical pool is shared. Bound it by the smallest rank's
+            # physical capacity even if all active requests land on that rank.
+            return min(capacities)
         except BaseException:
             self.close()
             raise
+
+    def _initialize_native(self, *, warm_up=False):
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.kv_cache_utils import (
+            generate_scheduler_kv_cache_config, get_kv_cache_configs, resolve_kv_cache_block_sizes,
+        )
+        from vllm.v1.executor.abstract import Executor
+
+        self.worker = Executor.get_class(self.config)(self.config)
+        specs = self.worker.get_kv_cache_specs()
+        if warm_up:
+            from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+            layout = resolve_kv_cache_layout(
+                self.config, self.worker.get_supported_kv_cache_layouts(),
+                [spec for rank_specs in specs for spec in rank_specs.values()],
+            )
+            self.worker.set_kv_cache_layout(layout.name)
+        available = self.worker.determine_available_memory()
+        caches = get_kv_cache_configs(self.config, specs, available)
+        if warm_up:
+            for cache in caches:
+                cache.kv_cache_layout = self.config.cache_config.kv_cache_layout
+        scheduler_cache = generate_scheduler_kv_cache_config(caches)
+        logical_pages = logical_page_capacity(scheduler_cache, self.runtime)
+        self.config.cache_config.num_gpu_blocks = scheduler_cache.num_blocks
+        self.worker.initialize_from_config(caches)
+        if warm_up:
+            self.worker.compile_or_warm_up_model()
+        block_size, hash_size = resolve_kv_cache_block_sizes(scheduler_cache, self.config)
+        self.native_kv = KVCacheManager(
+            scheduler_cache, max_model_len=self.runtime.max_seq_len,
+            scheduler_block_size=block_size, hash_block_size=hash_size,
+            max_in_flight_tokens=self.config.max_in_flight_tokens, enable_caching=False,
+        )
+        self._group_count = len(scheduler_cache.kv_cache_groups)
+        self._zero_blocks = scheduler_cache.needs_kv_cache_zeroing
+        logger.info("Torch V4.1 vLLM=0.30 TP=%d devices=%s graph=%s async=%s "
+                    "native_physical_blocks=%d groups=%d serving_logical_pages=%d prefix_cache=False",
+                    len(self.device_ids), self.device_ids, self.graph_mode, self.async_scheduling,
+                    scheduler_cache.num_blocks, self._group_count, logical_pages)
+        return logical_pages
 
     def _fail(self, error):
         with self._outputs_ready:
             self._async_error = error
             self._outputs_ready.notify_all()
+        for group in self._dp_groups:
+            group._fail(error)
 
     def register_requests(self, requests):
+        if self._dp_groups:
+            for request in requests:
+                rank = self._request_dp.get(request.request_id)
+                if rank is None:
+                    rank = min(range(len(self._dp_groups)), key=lambda r: len(self._dp_groups[r]._requests))
+                    self._request_dp[request.request_id] = rank
+                self._dp_groups[rank].register_requests((request,))
+            return
         for request in requests:
             if request.constraint_spec is not None:
                 raise ValueError("Torch V4.1 structured constraints require a native grammar bridge")
@@ -187,6 +270,16 @@ class TorchDeepSeekV41Executor(ModelExecutor):
                 self._cpu_tokens[request_id] = []
 
     def release_finished_requests(self, request_ids):
+        if self._dp_groups:
+            per_rank = [[] for _ in self._dp_groups]
+            for request_id in request_ids:
+                rank = self._request_dp.pop(request_id, None)
+                if rank is not None:
+                    per_rank[rank].append(request_id)
+            for group, finished in zip(self._dp_groups, per_rank, strict=True):
+                if finished:
+                    group.release_finished_requests(finished)
+            return
         for request_id in request_ids:
             if request_id in self._started:
                 self._finished.add(request_id)
@@ -279,6 +372,8 @@ class TorchDeepSeekV41Executor(ModelExecutor):
         if not device_sampling:
             raise ValueError("Torch V4.1 requires native sampling; host-logit policies are unsupported")
         try:
+            if self._dp_groups:
+                return self._submit_dp_step(request_ids, counts, computed, stop_masks)
             schedule = self._schedule(request_ids, counts, computed)
             execution = self.worker.execute_model(schedule, non_block=True)
             if stop_masks:
@@ -291,11 +386,60 @@ class TorchDeepSeekV41Executor(ModelExecutor):
             self._fail(error)
             raise
 
+    def _submit_dp_step(self, request_ids, counts, computed, stop_masks):
+        if self._async_error is not None:
+            raise RuntimeError("An earlier V4.1 output failed") from self._async_error
+        positions = [[] for _ in self._dp_groups]
+        for i, request_id in enumerate(request_ids):
+            positions[self._request_dp[request_id]].append(i)
+        groups = []
+        for group, indices in zip(self._dp_groups, positions, strict=True):
+            ids = tuple(request_ids[i] for i in indices)
+            schedule = None
+            if ids:
+                schedule = group._schedule(ids, (counts[i] for i in indices), (computed[i] for i in indices))
+            groups.append((group, ids, schedule))
+
+        executions = []
+        for group, ids, schedule in groups:
+            if ids:
+                execution = group.worker.execute_model(schedule, non_block=True)
+            else:
+                execution = group.worker.collective_rpc(
+                    "execute_dummy_batch", unique_reply_rank=group.worker.output_rank, non_block=True,
+                )
+            executions.append(execution)
+
+        outputs = []
+        for (group, ids, _), execution in zip(groups, executions, strict=True):
+            sampling = masking = None
+            if ids:
+                masks = {rid: stop_masks[rid] for rid in ids if rid in stop_masks} if stop_masks else {}
+                if masks:
+                    masking = group.worker.collective_rpc(apply_stop_masks, args=(masks,), non_block=True)
+                sampling = group.worker.sample_tokens(None, non_block=True)
+                group._previous_ids = set(ids)
+            outputs.append(PendingOutput(ids, execution, sampling, masking))
+        return PendingDPStep(tuple(request_ids), tuple(outputs))
+
     def _reclaim(self, pending):
         try:
+            if isinstance(pending, PendingDPStep):
+                sampled = {}
+                for group, output in zip(self._dp_groups, pending.outputs, strict=True):
+                    if not output.request_ids:
+                        with group._rpc_read_lock:
+                            output.execution.result()
+                        continue
+                    _, tokens = group._reclaim(output)
+                    sampled.update(zip(output.request_ids, tokens.tolist(), strict=True))
+                tokens = torch.tensor([sampled[rid] for rid in pending.request_ids], dtype=torch.long)
+                return torch.empty((len(tokens), 0)), tokens
             with self._rpc_read_lock:
                 if pending.execution.result() is not None:
                     raise RuntimeError("Expected a deferred native sampling result")
+                if pending.masking is not None:
+                    pending.masking.result()
                 output = pending.sampling.result()
                 if callable(getattr(output, "get_output", None)):
                     output = output.get_output()
@@ -352,6 +496,11 @@ class TorchDeepSeekV41Executor(ModelExecutor):
         return self.reclaim_prepared_decode(self.dispatch_prepared_decode(model, batch, prepared))
 
     def close(self):
+        groups, self._dp_groups = self._dp_groups, ()
+        self._request_dp.clear()
+        if groups:
+            with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+                list(pool.map(TorchDeepSeekV41Executor.close, groups))
         worker, self.worker = self.worker, None
         if worker is not None:
             worker.shutdown()

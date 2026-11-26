@@ -9,11 +9,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 _SUPPORTED_ROUTING_POLICIES = {"least_pending_tokens"}
-_SUPPORTED_PLACEMENT_MODES = {"replica", "overlapped"}
+_SUPPORTED_PLACEMENT_MODES = {"replica", "overlapped", "data_expert"}
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,8 @@ class ParallelConfig:
     independent model replicas and each replica owns one TP device group.
     ``overlapped`` placement describes hybrid kernels whose DP, TP, and EP
     axes reuse the same physical ranks, as DeepSeekV4 does.
+    ``data_expert`` keeps TP groups distinct and runs one EP group across
+    every TP rank of every DP group, under one serving scheduler.
     """
 
     data_parallel_size: int = 1
@@ -59,7 +61,12 @@ class ParallelConfig:
         if self.placement_mode == "replica" and (
             self.enable_expert_parallel or self.expert_parallel_size != 1
         ):
-            raise ValueError("expert parallel requires overlapped placement")
+            raise ValueError("expert parallel requires overlapped or data_expert placement")
+        if self.placement_mode == "data_expert" and (
+            not self.enable_expert_parallel or self.data_parallel_size < 2
+            or self.expert_parallel_size != self.data_parallel_size * self.tensor_parallel_size
+        ):
+            raise ValueError("data_expert placement requires DP > 1 and enabled EP = DP * TP")
         if self.placement_mode == "overlapped":
             if self.enable_expert_parallel != (self.expert_parallel_size > 1):
                 raise ValueError(
@@ -101,7 +108,7 @@ class ParallelConfig:
     @property
     def num_replicas(self) -> int:
         """Return the number of independently routed serving replicas."""
-        if self.placement_mode == "overlapped":
+        if self.placement_mode != "replica":
             return 1
         return self.data_parallel_size
 
@@ -114,6 +121,8 @@ class ParallelConfig:
                 self.tensor_parallel_size,
                 self.expert_parallel_size,
             )
+        if self.placement_mode == "data_expert":
+            return self.data_parallel_size * self.tensor_parallel_size
         return self.tensor_parallel_size
 
     @property
@@ -128,19 +137,8 @@ class ParallelConfig:
 
     def for_replica(self, device_group: tuple[int, ...]) -> "ParallelConfig":
         """Return the parallel topology visible to one serving worker."""
-        if self.placement_mode == "overlapped":
-            return ParallelConfig(
-                data_parallel_size=self.data_parallel_size,
-                tensor_parallel_size=self.tensor_parallel_size,
-                expert_parallel_size=self.expert_parallel_size,
-                pipeline_parallel_size=self.pipeline_parallel_size,
-                enable_expert_parallel=self.enable_expert_parallel,
-                expert_placement_strategy=self.expert_placement_strategy,
-                all2all_backend=self.all2all_backend,
-                devices=device_group,
-                data_parallel_routing=self.data_parallel_routing,
-                placement_mode=self.placement_mode,
-            )
+        if self.placement_mode != "replica":
+            return replace(self, devices=device_group)
         return ParallelConfig(
             data_parallel_size=1,
             tensor_parallel_size=len(device_group),

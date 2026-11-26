@@ -27,16 +27,16 @@ from pypto_serving.model.model_loader import ModelLoader
 from pypto_serving.serving.server.ipc import NewRequestData
 
 
-def raw_config():
+def raw_config(heads=2):
     return dict(model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"],
                 quantization_config=dict(quant_method="ascend", model_quant_type="W8A8_DYNAMIC"),
                 text_config=dict(hidden_size=8, vocab_size=32, num_hidden_layers=1,
-                                 num_attention_heads=2, head_dim=4, moe_intermediate_size=16,
+                                 num_attention_heads=heads, head_dim=4, moe_intermediate_size=16,
                                  max_position_embeddings=256, rope_theta=10000))
 
 
-def config(tmp_path, *extra):
-    (tmp_path / "config.json").write_text(json.dumps(raw_config()))
+def config(tmp_path, *extra, heads=2):
+    (tmp_path / "config.json").write_text(json.dumps(raw_config(heads)))
     args = build_parser().parse_args([
         "--model", str(tmp_path), "--backend", "torch", "--no-enable-prefix-caching",
         "--max-model-len", "128", "--block-size", "64", *extra])
@@ -120,6 +120,18 @@ def test_cli_uses_one_serving_scheduler_and_native_tp_group(tmp_path):
     assert result.sampling_capabilities().stop_mask_on_device("decode")
 
 
+def test_cli_keeps_dp4_tp4_ep16_under_one_serving_scheduler(tmp_path):
+    devices = tuple(range(16))
+    result = config(tmp_path, "--devices", ",".join(map(str, devices)),
+                    "--tp", "4", "--dp", "4", "--ep", "16", heads=4)
+    parallel = result.parallel_config
+    assert (parallel.data_parallel_size, parallel.tensor_parallel_size, parallel.expert_parallel_size) == (4, 4, 16)
+    assert parallel.num_replicas == 1
+    assert parallel.replica_device_groups == (devices,)
+    assert parallel.for_replica(devices) == parallel
+    assert result.executor_kwargs["data_parallel_size"] == 4
+
+
 @pytest.mark.parametrize("options,match", [
     (("--enable-prefix-caching",), "prefix"),
     (("--platform", "a5"), "a2a3"),
@@ -198,6 +210,50 @@ def test_device_submission_does_not_wait_for_sampling_or_cpu_tokens():
     assert [x[0] for x in e.worker.calls] == ["execute", "sample", "execute", "sample"]
     assert not first.sampling.done() and not second.sampling.done()
     assert e.worker.calls[2][1].scheduled_cached_reqs.num_output_tokens == [1]
+
+
+def test_dp_dispatch_uses_idle_ranks_and_reassembles_request_order():
+    submitted = []
+
+    class RankedRPC(RPC):
+        output_rank = 0
+
+        def __init__(self, rank):
+            super().__init__()
+            self.rank = rank
+
+        def execute_model(self, schedule, non_block=False):
+            submitted.append((self.rank, "execute"))
+            return super().execute_model(schedule, non_block)
+
+        def sample_tokens(self, grammar, non_block=False):
+            submitted.append((self.rank, "sample"))
+            return super().sample_tokens(grammar, non_block)
+
+        def collective_rpc(self, method, *, unique_reply_rank, non_block):
+            assert method == "execute_dummy_batch" and unique_reply_rank == 0 and non_block
+            submitted.append((self.rank, "dummy"))
+            future = Future()
+            future.set_result(None)
+            return future
+
+    e = TorchDeepSeekV41Executor(device_ids=tuple(range(16)), data_parallel_size=4)
+    e._dp_groups = tuple(executor() for _ in range(4))
+    for rank, group in enumerate(e._dp_groups):
+        group.worker = RankedRPC(rank)
+    e.register_requests([request("a"), request("b")])
+    pending = e._submit(["b", "a"], [4, 4], [0, 0], device_sampling=True, stop_masks={})
+    assert submitted == [(0, "execute"), (1, "execute"), (2, "dummy"), (3, "dummy"), (0, "sample"), (1, "sample")]
+    for rank, rid in enumerate(("a", "b")):
+        worker = e._dp_groups[rank].worker
+        worker.executions[0].set_result(None)
+        worker.samplings[0].set_result(NS(req_id_to_index={rid: 0}, sampled_token_ids=[[rank + 20]]))
+    _, tokens = e._reclaim(pending)
+    assert tokens.tolist() == [21, 20]
+    e.release_finished_requests(["a", "b"])
+    assert e._dp_groups[0].native_kv.freed == ["a"]
+    assert e._dp_groups[1].native_kv.freed == ["b"]
+    assert not e._request_dp
 
 
 def test_reclaim_reorders_native_rows_and_publishes_cpu_history():

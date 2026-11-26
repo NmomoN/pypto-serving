@@ -39,10 +39,10 @@ def build_torch_engine_config(args, model_dir, raw, devices):
     text = validate_checkpoint_config(raw)
     if args.platform != "a2a3":
         raise ValueError("Torch V4.1 W8A8 requires platform a2a3")
-    if (args.data_parallel_size != 1 or args.expert_parallel_size != 1
-            or args.tensor_parallel_size != len(devices)):
-        raise ValueError("Torch V4.1 requires DP=EP=1 and TP equal to the number of devices")
-    if text["num_attention_heads"] % len(devices):
+    tp, dp, ep = args.tensor_parallel_size, args.data_parallel_size, args.expert_parallel_size
+    if dp < 1 or tp < 1 or dp * tp != len(devices) or ep != (len(devices) if dp > 1 else 1):
+        raise ValueError("Torch V4.1 requires TP equal to devices for DP=EP=1, or EP=DP*TP=devices")
+    if text["num_attention_heads"] % tp:
         raise ValueError("V4.1 attention heads must be divisible by TP")
     if args.dtype != "bfloat16" or args.kv_cache_dtype not in ("auto", "bfloat16"):
         raise ValueError("Torch V4.1 requires BF16 activation and KV metadata with W8A8 weights")
@@ -52,7 +52,10 @@ def build_torch_engine_config(args, model_dir, raw, devices):
         raise ValueError("Torch V4.1 requires --no-enable-prefix-caching for recurrent/Engram state")
     if args.num_speculative_tokens or args.speculative_config:
         raise ValueError("Torch V4.1 initially supports target-only autoregressive decoding")
-    parallel = ParallelConfig(devices=devices, tensor_parallel_size=len(devices))
+    parallel = ParallelConfig(
+        devices=devices, tensor_parallel_size=tp, data_parallel_size=dp, expert_parallel_size=ep,
+        enable_expert_parallel=dp > 1, placement_mode="data_expert" if dp > 1 else "replica",
+    )
     runtime = RuntimeConfig(
         device="cpu", page_size=args.block_size, max_batch_size=args.max_num_seqs,
         max_seq_len=args.max_model_len, weight_dtype="bfloat16", kv_dtype="bfloat16",
@@ -64,6 +67,7 @@ def build_torch_engine_config(args, model_dir, raw, devices):
         model_dir=model_dir, platform=args.platform, device_id=devices[0], device_ids=devices,
         parallel_config=parallel, executor_cls="TorchDeepSeekV41Executor",
         executor_kwargs=dict(graph_mode=args.torch_graph_mode,
+                             data_parallel_size=dp,
                              async_scheduling=args.async_scheduling is not False,
                              enable_chunked_prefill=args.enable_chunked_prefill),
         runtime_config=runtime, profile_config=_build_profile_config(args),
